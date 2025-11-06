@@ -15,6 +15,8 @@
 (define-constant err-invalid-location (err u113))
 (define-constant err-response-exists (err u114))
 (define-constant err-no-response (err u115))
+(define-constant err-not-escalatable (err u116))
+(define-constant err-already-escalated (err u117))
 
 (define-constant severity-critical u5)
 (define-constant severity-high u4)
@@ -27,6 +29,11 @@
 (define-constant status-investigating "investigating")
 (define-constant status-resolved "resolved")
 (define-constant status-disputed "disputed")
+(define-constant status-escalated "escalated")
+
+(define-constant escalation-threshold-critical u144)
+(define-constant escalation-threshold-high u288)
+(define-constant escalation-threshold-medium u576)
 
 (define-data-var report-id-nonce uint u0)
 (define-data-var total-reports uint u0)
@@ -100,6 +107,14 @@
     verified-reports: uint,
     authorization-date: uint,
     is-active: bool
+})
+
+(define-map report-escalations uint {
+    report-id: uint,
+    escalated-at: uint,
+    escalation-reason: (string-utf8 200),
+    escalated-by: principal,
+    severity-penalty: uint
 })
 
 (define-public (register-company (name (string-ascii 100)) (industry (string-ascii 50)))
@@ -273,6 +288,52 @@
             (merge report { status: status-disputed }))
         (ok true)))
 
+(define-public (escalate-report (report-id uint) (escalation-reason (string-utf8 200)))
+    (let 
+        ((report (unwrap! (map-get? hazard-reports report-id) err-report-not-found))
+         (time-elapsed (- stacks-block-height (get reported-at report)))
+         (report-severity (get severity report))
+         (report-status (get status report))
+         (escalator tx-sender))
+        
+        (asserts! (is-none (map-get? report-escalations report-id)) err-already-escalated)
+        (asserts! (or (is-eq report-status status-pending) 
+                      (is-eq report-status status-verified)
+                      (is-eq report-status status-investigating)) err-not-escalatable)
+        (asserts! (or (is-eq report-status status-resolved)
+                      (is-eq report-status status-disputed)
+                      (not (is-eq report-status status-escalated))) err-already-resolved)
+        
+        (asserts! (or 
+            (and (is-eq report-severity severity-critical) (>= time-elapsed escalation-threshold-critical))
+            (and (is-eq report-severity severity-high) (>= time-elapsed escalation-threshold-high))
+            (and (is-eq report-severity severity-medium) (>= time-elapsed escalation-threshold-medium))) 
+            err-not-escalatable)
+        
+        (let ((penalty-amount (* report-severity u5)))
+            (map-set report-escalations report-id {
+                report-id: report-id,
+                escalated-at: stacks-block-height,
+                escalation-reason: escalation-reason,
+                escalated-by: escalator,
+                severity-penalty: penalty-amount
+            })
+            
+            (map-set hazard-reports report-id
+                (merge report { status: status-escalated }))
+            
+            (match (map-get? companies (get company report))
+                company-data
+                (map-set companies (get company report)
+                    (merge company-data {
+                        safety-score: (if (>= (get safety-score company-data) penalty-amount)
+                                        (- (get safety-score company-data) penalty-amount)
+                                        u0)
+                    }))
+                true)
+            
+            (ok true))))
+
 (define-private (update-company-metrics (company principal) (severity uint) (resolved bool))
     (match (map-get? companies company)
         company-data 
@@ -363,4 +424,35 @@
                    (/ risk-factor (get resolved-reports company-data))
                    risk-factor)))
         (err err-company-not-found)))
+
+(define-read-only (is-report-escalatable (report-id uint))
+    (match (map-get? hazard-reports report-id)
+        report
+        (let 
+            ((time-elapsed (- stacks-block-height (get reported-at report)))
+             (report-severity (get severity report))
+             (report-status (get status report))
+             (already-escalated (is-some (map-get? report-escalations report-id))))
+            
+            (ok {
+                escalatable: (and 
+                    (not already-escalated)
+                    (or (is-eq report-status status-pending) 
+                        (is-eq report-status status-verified)
+                        (is-eq report-status status-investigating))
+                    (or 
+                        (and (is-eq report-severity severity-critical) (>= time-elapsed escalation-threshold-critical))
+                        (and (is-eq report-severity severity-high) (>= time-elapsed escalation-threshold-high))
+                        (and (is-eq report-severity severity-medium) (>= time-elapsed escalation-threshold-medium)))),
+                time-elapsed: time-elapsed,
+                required-threshold: (if (is-eq report-severity severity-critical)
+                                       escalation-threshold-critical
+                                       (if (is-eq report-severity severity-high)
+                                          escalation-threshold-high
+                                          escalation-threshold-medium))
+            }))
+        (err err-report-not-found)))
+
+(define-read-only (get-escalation-details (report-id uint))
+    (map-get? report-escalations report-id))
 
